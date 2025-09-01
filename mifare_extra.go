@@ -6,7 +6,10 @@ import (
 	"time"
 )
 
-const maxSectors = uint8(16)
+const (
+	maxSectors = uint8(16)
+	maxBlocks  = uint8(64)
+)
 
 var (
 	// Usual factory key
@@ -21,13 +24,15 @@ var (
 	bT0 = []byte{0x78, 0x77, 0x88, 0xC1}
 	btN = []byte{0x7F, 0x07, 0x88, 0x40}
 
-	// We hardcode the block data for sector 0
+	// Fixed block data for sector 0
 	b1 = []byte{0x0F, 0x00, 0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1}
 	b2 = []byte{0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1, 0x03, 0xE1}
 	b3 = []byte{0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x78, 0x77, 0x88, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
-	bn = []byte{0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7, 0x7F, 0x07, 0x88, 0x40, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
 
+	// Fixed block header (only when formatting)
 	bnH = []byte{0x03, 0x00, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	// Fixed block trailer
+	bn = []byte{0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7, 0x7F, 0x07, 0x88, 0x40, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
 )
 
 // IsNDEFFormatted checks if the tag is NDEF formatted with the default NDEF KeyA
@@ -106,10 +111,77 @@ func (t *MIFARETag) WriteNDEFAlternative(message *NDEFMessage) error {
 	}
 
 	// Skip validation because we know our size
-	if err := t.writeNDEFData(data); err != nil {
+	if err := t.writeNDEFDataAlternative(data); err != nil {
 		return err
 	}
 
 	// We don't clear blocks because we have formatted with a special scheme above
+	return nil
+}
+
+func (t *MIFARETag) writeNDEFDataAlternative(data []byte) error {
+	block := uint8(4)
+	for i := 0; i < len(data); i += mifareBlockSize {
+		if block%4 == 3 {
+			block++
+		}
+
+		if block >= maxBlocks {
+			return errors.New("NDEF data exceeds tag capacity")
+		}
+
+		if err := t.writeDataBlockAlternative(block, data, i); err != nil {
+			return err
+		}
+		block++
+	}
+	return nil
+}
+
+func (t *MIFARETag) writeDataBlockAlternative(block uint8, data []byte, offset int) error {
+	end := offset + mifareBlockSize
+	if end > len(data) {
+		blockData := make([]byte, mifareBlockSize)
+		copy(blockData, data[offset:])
+		return t.writeBlockWithErrorAlternative(block, blockData)
+	}
+	return t.writeBlockWithErrorAlternative(block, data[offset:end])
+}
+
+func (t *MIFARETag) writeBlockWithErrorAlternative(block uint8, data []byte) error {
+	if err := t.WriteBlockAutoAlternative(block, data); err != nil {
+		return fmt.Errorf("failed to write block %d: %w", block, err)
+	}
+	return nil
+}
+
+func (t *MIFARETag) WriteBlockAutoAlternative(block uint8, data []byte) error {
+	sector := block / mifareSectorSize
+
+	// Check if we need to authenticate
+	if t.lastAuthSector != int(sector) {
+		// For write operations, typically Key B is required (but this depends on access bits)
+		// Try Key B first, then Key A
+		err := t.authenticateNDEFAlternative(sector, MIFAREKeyB)
+		if err != nil {
+			// Try Key A
+			err = t.authenticateNDEFAlternative(sector, MIFAREKeyA)
+			if err != nil {
+				return fmt.Errorf("failed to authenticate to sector %d: %w", sector, err)
+			}
+		}
+	}
+
+	return t.WriteBlock(block, data)
+}
+
+func (t *MIFARETag) authenticateNDEFAlternative(sector uint8, keyType byte) error {
+	// Because we know the standard NDEF layout we can perform some shortcuts cutting down auth time.
+	switch keyType {
+	case MIFAREKeyA:
+		return t.AuthenticateRobust(sector, keyType, nKey)
+	case MIFAREKeyB:
+		return t.AuthenticateRobust(sector, keyType, fKey)
+	}
 	return nil
 }
